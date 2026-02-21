@@ -1,0 +1,31 @@
+services:
+  # Our control plane — the xDS server + management API
+  controlplane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"   # management API (add/remove services)
+      - "9090:9090"   # xDS gRPC (Envoy connects here)
+
+  # Envoy — dynamically configured by our control plane
+  envoy:
+    image: envoyproxy/envoy:v1.37-latest
+    volumes:
+      - ./envoy/bootstrap.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "10000:10000" # data plane (incoming HTTP traffic)
+      - "9901:9901"   # envoy admin UI (stats, config dump)
+    depends_on:
+      - controlplane
+
+  # Dummy upstream A — a simple web server to verify routing works.
+  # Returns its own container name so you can tell which upstream responded.
+  web-a:
+    image: hashicorp/http-echo
+    command: ["-text=Hello from upstream A"]
+
+  # Dummy upstream B — second target to test dynamic switching
+  web-b:
+    image: hashicorp/http-echo
+    command: ["-text=Hello from upstream B"]
