@@ -24,93 +24,98 @@ import (
 // Server is the xDS control plane server.
 //
 // Architecture:
-//   Registry (service state)
-//       │ onChange callback
-//       ▼
-//   SnapshotBuilder (registry → Envoy resources)
-//       │
-//       ▼
-//   SnapshotCache (holds versioned snapshots per Envoy node)
-//       │
-//       ▼
-//   go-control-plane Server (handles gRPC streams, ACK/NACK)
-//       │
-//       ▼
-//   Envoy (subscribes via ADS)
 //
-// When the registry changes, we rebuild the entire snapshot and set it
-// on the cache. go-control-plane handles diffing and streaming to Envoy.
+//	Registry (service state)
+//	    │ onChange callback
+//	    ▼
+//	SnapshotBuilder (registry → per-node Envoy resources)
+//	    │ one snapshot per nodeID
+//	    ▼
+//	SnapshotCache (versioned snapshots keyed by node ID)
+//	    │
+//	    ▼
+//	go-control-plane Server (gRPC streams, ACK/NACK)
+//	    │
+//	    ├── envoyage-envoy-home → clusters point to local containers
+//	    └── envoyage-envoy-vps  → clusters point to envoy-home:10000
+//
+// Split-Horizon routing: both Envoys subscribe to the same control plane,
+// but each receives a different view of the world tailored to its role.
+// The home Envoy knows the real upstreams; the VPS Envoy only ever talks
+// to the home Envoy (simulating the WireGuard tunnel in production).
 type Server struct {
 	cache   cachev3.SnapshotCache
 	builder *SnapshotBuilder
 	reg     *registry.Registry
-	nodeID  string
+	nodeIDs []string
 	log     *slog.Logger
 }
 
 // NewServer creates an xDS server wired to the given registry.
 //
-// nodeID must match the node.id in Envoy's bootstrap config.
-// Envoy identifies itself with this ID when subscribing to xDS.
-// The cache uses it to look up which snapshot to serve.
-func NewServer(reg *registry.Registry, nodeID string, log *slog.Logger) *Server {
+// nodeIDs lists every Envoy instance the control plane manages.
+// Each node must set a matching node.id in its Envoy bootstrap config.
+func NewServer(reg *registry.Registry, nodeIDs []string, log *slog.Logger) *Server {
 	s := &Server{
-		// hash.NewNodeHash() would allow different configs per Envoy node.
-		// For now, we use IDHash which maps node.id directly to cache keys.
+		// IDHash maps node.id strings directly to cache keys.
+		// NodeHash would allow more complex grouping — not needed yet.
 		cache:   cachev3.NewSnapshotCache(true, cachev3.IDHash{}, nil),
 		builder: NewSnapshotBuilder(),
 		reg:     reg,
-		nodeID:  nodeID,
+		nodeIDs: nodeIDs,
 		log:     log,
 	}
 
-	// Wire up: registry change → rebuild snapshot → push to cache
+	// Wire up: every registry mutation → rebuild all per-node snapshots.
 	reg.OnChange(func() {
-		if err := s.rebuildSnapshot(); err != nil {
-			log.Error("failed to rebuild xDS snapshot", "error", err)
+		if err := s.rebuildSnapshots(); err != nil {
+			log.Error("failed to rebuild xDS snapshots", "error", err)
 		}
 	})
 
 	return s
 }
 
-// rebuildSnapshot reads the current registry state, builds a new Envoy
-// snapshot, validates it, and pushes it to the cache. go-control-plane
-// then handles the gRPC streaming to connected Envoy instances.
-func (s *Server) rebuildSnapshot() error {
+// rebuildSnapshots reads the current registry state and pushes a fresh,
+// tailored snapshot into the cache for every registered node.
+//
+// go-control-plane handles the downstream gRPC streaming to connected Envoys.
+func (s *Server) rebuildSnapshots() error {
 	services, version := s.reg.Snapshot()
 
-	snap, err := s.builder.Build(services, version)
-	if err != nil {
-		return fmt.Errorf("building snapshot v%d: %w", version, err)
+	for _, nodeID := range s.nodeIDs {
+		snap, err := s.builder.Build(nodeID, services, version)
+		if err != nil {
+			return fmt.Errorf("building snapshot v%d for node %q: %w", version, nodeID, err)
+		}
+
+		if err := s.cache.SetSnapshot(context.Background(), nodeID, snap); err != nil {
+			return fmt.Errorf("setting snapshot v%d for node %q: %w", version, nodeID, err)
+		}
 	}
 
-	if err := s.cache.SetSnapshot(context.Background(), s.nodeID, snap); err != nil {
-		return fmt.Errorf("setting snapshot v%d: %w", version, err)
-	}
-
-	s.log.Info("pushed xDS snapshot", "version", version, "services", len(services))
+	s.log.Info("pushed xDS snapshots",
+		   "version", version,
+	    "services", len(services),
+		   "nodes", len(s.nodeIDs),
+	)
 	return nil
 }
 
-// Seed pushes an initial snapshot so Envoy has something to load on connect.
-// Without this, Envoy would wait (potentially forever) for the first snapshot.
+// Seed pushes an initial empty snapshot for every node so that Envoy has
+// something to load immediately on connect and does not stall.
 func (s *Server) Seed() error {
-	return s.rebuildSnapshot()
+	return s.rebuildSnapshots()
 }
 
 // Serve starts the gRPC server on the given address (e.g. ":9090").
 //
-// This registers all xDS service handlers. Envoy connects here and subscribes
-// to resource types (LDS, RDS, CDS, EDS, SDS) via a single ADS stream.
-//
-// ADS (Aggregated Discovery Service) multiplexes all resource types over one
-// gRPC stream. This guarantees ordering: Envoy gets clusters before endpoints,
-// listeners before routes, etc. Without ADS, race conditions can cause Envoy
-// to reference a cluster that hasn't been delivered yet → NACK.
+// All xDS service types (LDS, RDS, CDS, EDS, SDS) are registered and
+// multiplexed over a single ADS stream. ADS guarantees ordering:
+// clusters arrive before routes, listeners after their dependencies.
+// Without ADS, race conditions can cause Envoy to NACK a listener that
+// references a cluster that hasn't been delivered yet.
 func (s *Server) Serve(ctx context.Context, addr string) error {
-	// go-control-plane's server handles the xDS protocol:
-	// stream management, ACK/NACK tracking, version diffing.
 	xdsServer := serverv3.NewServer(ctx, s.cache, nil)
 
 	grpcServer := grpc.NewServer()
@@ -123,7 +128,6 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 
 	s.log.Info("xDS server listening", "addr", addr)
 
-	// Graceful shutdown: when ctx is canceled, stop accepting new connections.
 	go func() {
 		<-ctx.Done()
 		s.log.Info("shutting down xDS server")
@@ -133,9 +137,8 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	return grpcServer.Serve(lis)
 }
 
-// registerXDSServices registers all xDS service handlers on the gRPC server.
-// Each service corresponds to a resource type (LDS, RDS, CDS, EDS, SDS).
-// The ADS handler is special — it aggregates all types on one stream.
+// registerXDSServices registers all resource-type handlers on the gRPC server.
+// The ADS handler is the critical one — it aggregates all types on one stream.
 func registerXDSServices(grpcServer *grpc.Server, xdsServer serverv3.Server) {
 	discoverygrpc.RegisterAggregatedDiscoveryServiceServer(grpcServer, xdsServer)
 	clusterservice.RegisterClusterDiscoveryServiceServer(grpcServer, xdsServer)

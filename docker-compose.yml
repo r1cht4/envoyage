@@ -1,0 +1,68 @@
+services:
+
+  # ── Control Plane ──────────────────────────────────────────────────────────
+  controlplane:
+    build: .
+    ports:
+      - "8080:8080"   # Management API  (curl http://localhost:8080/services)
+      - "9090:9090"   # xDS gRPC        (both Envoys connect here)
+    networks:
+      - envoyage
+
+  # ── Home Envoy (simulates the Homeserver Envoy) ────────────────────────────
+  # Receives a snapshot where every cluster target is the real app container.
+  # Exposed on host port 10001 so you can probe it directly for debugging
+  # (in production, only the VPS Envoy is public-facing).
+  envoy-home:
+    image: envoyproxy/envoy:v1.32-latest
+    command: -c /etc/envoy/bootstrap.yaml --log-level info
+    volumes:
+      - ./envoy/bootstrap-home.yaml:/etc/envoy/bootstrap.yaml:ro
+    ports:
+      - "10001:10000"  # Data plane ingress (host 10001 → container 10000)
+      - "9901:9901"    # Envoy admin UI
+    depends_on:
+      - controlplane
+    networks:
+      - envoyage
+
+  # ── VPS Envoy (simulates the Edge / Internet-facing Envoy) ─────────────────
+  # Receives a snapshot where every cluster target is envoy-home:10000.
+  # This simulates the WireGuard tunnel: VPS Envoy → Home Envoy → Container.
+  # This is the port external users would hit; test via host port 10000.
+  envoy-vps:
+    image: envoyproxy/envoy:v1.32-latest
+    command: -c /etc/envoy/bootstrap.yaml --log-level info
+    volumes:
+      - ./envoy/bootstrap-vps.yaml:/etc/envoy/bootstrap.yaml:ro
+    ports:
+      - "10000:10000"  # Data plane ingress (host 10000 → container 10000)
+      - "9902:9902"    # Envoy admin UI
+    depends_on:
+      - controlplane
+      - envoy-home
+    networks:
+      - envoyage
+
+  # ── Dummy Upstreams ────────────────────────────────────────────────────────
+  # Tiny HTTP servers that identify themselves so we can verify routing.
+  # The home Envoy knows about these; the VPS Envoy never talks to them.
+  web-a:
+    image: python:3.12-alpine
+    command: >
+      sh -c "echo 'Hello from upstream A' > /tmp/index.html &&
+             python3 -m http.server 5678 --directory /tmp"
+    networks:
+      - envoyage
+
+  web-b:
+    image: python:3.12-alpine
+    command: >
+      sh -c "echo 'Hello from upstream B' > /tmp/index.html &&
+             python3 -m http.server 5678 --directory /tmp"
+    networks:
+      - envoyage
+
+networks:
+  envoyage:
+    driver: bridge

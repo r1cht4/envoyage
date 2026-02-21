@@ -7,22 +7,26 @@ import (
 
 // Service represents a single routable application.
 // This is our internal model — the xDS layer translates it to Envoy resources.
+//
+// Upstream is stored as "host:port" from the registrant's perspective (i.e.
+// as the home node sees it). The SnapshotBuilder rewrites the target for edge
+// nodes transparently — callers never need to know about Split-Horizon routing.
 type Service struct {
 	Name     string // unique identifier, e.g. "nextcloud"
-	Domain   string // FQDN for routing, e.g. "cloud.example.com"
-	Upstream string // host:port of the actual application
-	Port     uint32 // listener port (typically 443 for external, 80 for internal)
+	Domain   string // FQDN for virtual-host matching, e.g. "cloud.example.com"
+	Upstream string // host:port of the actual app, e.g. "web-a:5678"
 }
 
 // Registry is a thread-safe, in-memory store for services.
-// Will be backed by SQLite later, but in-memory is fine for the tracer bullet.
+// Will be backed by SQLite and populated by Docker discovery in a later phase.
 type Registry struct {
 	mu       sync.RWMutex
 	services map[string]*Service
 	version  uint64
 
-	// onChange is called whenever the registry is modified.
-	// The xDS layer hooks into this to push new snapshots.
+	// onChange is called after every mutation, outside the write lock.
+	// The xDS server hooks into this to push fresh snapshots to all Envoys.
+	// Only one callback is supported — intentional, keeps the coupling simple.
 	onChange func()
 }
 
@@ -32,8 +36,7 @@ func New() *Registry {
 	}
 }
 
-// OnChange registers a callback that fires after every mutation.
-// Only one callback is supported — this is intentional for simplicity.
+// OnChange registers the function to be called after each registry mutation.
 func (r *Registry) OnChange(fn func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -53,8 +56,9 @@ func (r *Registry) Add(svc *Service) error {
 	cb := r.onChange
 	r.mu.Unlock()
 
-	// Fire callback AFTER releasing the lock. onChange triggers a snapshot
-	// rebuild which needs a read lock — calling it under write lock deadlocks.
+	// Fire callback AFTER releasing the lock.
+	// onChange triggers a snapshot rebuild which needs a read lock —
+	// calling it under the write lock would deadlock.
 	if cb != nil {
 		cb()
 	}
@@ -81,7 +85,7 @@ func (r *Registry) Remove(name string) error {
 }
 
 // Update replaces an existing service. Useful when Docker labels change
-// or an agent re-registers with different upstream.
+// or an agent re-registers with a different upstream.
 func (r *Registry) Update(svc *Service) error {
 	r.mu.Lock()
 
@@ -101,8 +105,8 @@ func (r *Registry) Update(svc *Service) error {
 	return nil
 }
 
-// Snapshot returns a copy of all services and the current version.
-// The version is a monotonically increasing counter used for xDS snapshot versioning.
+// Snapshot returns a copy of all services and the current version counter.
+// The version is monotonically increasing and used for xDS snapshot versioning.
 func (r *Registry) Snapshot() ([]*Service, uint64) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

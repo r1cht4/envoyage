@@ -1,0 +1,61 @@
+# Envoy Bootstrap — Home Node
+#
+# The home Envoy receives its full routing configuration from the control plane.
+# It routes traffic directly to local app containers (Docker service names work
+# here because both Envoy and the containers share the same Docker network).
+#
+# In the Split-Horizon architecture:
+#   - This Envoy knows the real upstreams (e.g. web-a:5678)
+#   - The VPS Envoy only talks to this Envoy, never to the containers directly
+
+node:
+  # Must match homeEnvoyNodeID in internal/xds/snapshot.go
+  id: envoyage-envoy-home
+  cluster: envoyage
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc:
+          cluster_name: xds_cluster
+
+  lds_config:
+    resource_api_version: V3
+    ads: {}
+  cds_config:
+    resource_api_version: V3
+    ads: {}
+
+static_resources:
+  clusters:
+    - name: xds_cluster
+      connect_timeout: 5s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      # "controlplane" is the Docker Compose service name.
+                      # In production this will be localhost (control plane
+                      # runs on the home server alongside this Envoy).
+                      address: controlplane
+                      port_value: 9090
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901

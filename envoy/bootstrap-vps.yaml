@@ -1,0 +1,72 @@
+# Envoy Bootstrap — VPS / Edge Node
+#
+# The VPS Envoy is the public-facing edge proxy. It receives its configuration
+# from the same control plane as the home Envoy, but the control plane gives it
+# a different snapshot: every cluster target points to the home Envoy's ingress
+# port instead of the actual app containers.
+#
+# Traffic flow:
+#   Internet → VPS Envoy (:10000) → home Envoy (:10000) → app container
+#
+# In production:
+#   - The xDS gRPC connection uses the WireGuard tunnel (WG peer IP replaces
+#     the Docker Compose service name "controlplane" below).
+#   - The cluster targets inside the snapshot also use the WireGuard IP of
+#     the home node (homeEnvoyIngress constant in snapshot.go).
+#
+# In this Docker Compose simulation both Envoys share the same network, so
+# plain service names and host ports work as stand-ins for the real tunnel.
+
+node:
+  # Must NOT match homeEnvoyNodeID in snapshot.go — this triggers the edge
+  # routing path (all clusters → home Envoy instead of real containers).
+  id: envoyage-envoy-vps
+  cluster: envoyage
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc:
+          cluster_name: xds_cluster
+
+  lds_config:
+    resource_api_version: V3
+    ads: {}
+  cds_config:
+    resource_api_version: V3
+    ads: {}
+
+static_resources:
+  clusters:
+    - name: xds_cluster
+      connect_timeout: 5s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      # In production: WireGuard IP of the home server.
+                      # Here: Docker Compose service name.
+                      address: controlplane
+                      port_value: 9090
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      # Different admin port so both Envoys can be exposed on the host
+      # simultaneously without a port conflict.
+      port_value: 9902

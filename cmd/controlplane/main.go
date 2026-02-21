@@ -15,10 +15,18 @@ import (
 )
 
 const (
-	xdsAddr  = ":9090" // gRPC — Envoy connects here
-	apiAddr  = ":8080" // HTTP — management API for testing
-	nodeID   = "envoyage-envoy" // must match node.id in envoy bootstrap
+	xdsAddr = ":9090" // gRPC — Envoy connects here
+	apiAddr = ":8080" // HTTP — management API for testing
 )
+
+// nodeIDs lists every Envoy instance this control plane manages.
+// Each gets a tailored snapshot: home Envoy routes to local containers,
+// VPS Envoy routes everything to the home Envoy (via the WireGuard tunnel,
+// simulated here as a plain Docker network connection).
+var nodeIDs = []string{
+	"envoyage-envoy-home", // Home node: routes to actual app containers
+	"envoyage-envoy-vps",  // Edge node: routes to the home Envoy
+}
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -30,11 +38,11 @@ func main() {
 	reg := registry.New()
 
 	// --- xDS Server ---
-	// Translates registry state into Envoy config and serves it via gRPC.
-	xdsServer := xds.NewServer(reg, nodeID, log)
+	// Translates registry state into per-node Envoy configs and serves them via gRPC.
+	xdsServer := xds.NewServer(reg, nodeIDs, log)
 
-	// Seed an initial empty snapshot. Without this, Envoy blocks on connect
-	// waiting for resources that never arrive.
+	// Seed an initial empty snapshot for every node. Without this, Envoy blocks
+	// on connect waiting for resources that never arrive.
 	if err := xdsServer.Seed(); err != nil {
 		log.Error("failed to seed xDS", "error", err)
 		os.Exit(1)
@@ -103,7 +111,6 @@ func handleAddService(reg *registry.Registry, log *slog.Logger) http.HandlerFunc
 			Name:     req.Name,
 			Domain:   req.Domain,
 			Upstream: req.Upstream,
-			Port:     10000, // default Envoy listener port
 		}
 
 		if err := reg.Add(svc); err != nil {
