@@ -1,15 +1,76 @@
-# Binaries
+# --- Binaries & Build Artifacts ---
+/bin/
 envoyage-cp
+envoyage-agent
 *.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# Go test binaries
+*.test
+# Output of go build
+/build/
 
-# Go
+# --- Go Specifics ---
 /vendor/
+# Coverage & Profiling
+*.out
+*.prof
+# Go workspace file
+go.work
 
-# IDE
+# --- Frontend (Vue/React & Tailwind) ---
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+# Production build
+dist/
+build/
+.next/
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+# Editor/Tools
+.eslintcache
+.stylelintcache
+# Tailwind/PostCSS artifacts
+.parcel-cache
+.cache/
+
+# --- Database & Persistence (SQLite) ---
+# Da dein Config-Store auf SQLite basiert:
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# --- Security & Secrets (KRITISCH) ---
+# Niemals echte Keys committen!
+*.key
+*.priv
+privkey
+/certs/
+*.pem
+*.crt
+# Falls du .env Dateien für lokale Secrets nutzt
+.env
+.env.local
+.env.*.local
+
+# --- IDE & OS ---
 .idea/
 .vscode/
 *.swp
-
-# OS
+*.swo
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# --- Envoy & Docker Locals ---
+# Falls Envoy beim Testen Logs schreibt
+envoy/logs/
+# Docker local data volumes
+.docker-data/
