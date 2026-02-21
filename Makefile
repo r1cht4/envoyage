@@ -1,6 +1,6 @@
 .PHONY: up down logs clean \
-        test-add test-switch test-remove test-debug \
-        test-split-horizon list
+        test-auto test-manual-b test-split-horizon \
+        test-add test-switch test-remove test-debug list
 
 # ── Stack Management ──────────────────────────────────────────────────────────
 
@@ -9,13 +9,13 @@ up:
 	@echo ""
 	@echo "Stack is up. Endpoints:"
 	@echo "  Management API  : http://localhost:8080"
-	@echo "  VPS Envoy       : http://localhost:10000   ← simulates internet-facing edge"
-	@echo "  Home Envoy      : http://localhost:10001   ← simulates homeserver Envoy (debug)"
+	@echo "  VPS Envoy       : http://localhost:10000   ← internet-facing edge"
+	@echo "  Home Envoy      : http://localhost:10001   ← homeserver (debug)"
 	@echo "  Home Envoy admin: http://localhost:9901"
 	@echo "  VPS Envoy admin : http://localhost:9902"
 	@echo ""
-	@echo "Run 'make test-add' to register a service, then"
-	@echo "    'make test-split-horizon' to verify both routing paths."
+	@echo "web-a is auto-discovered via Docker labels."
+	@echo "Run 'make test-auto' to verify, or 'make logs' to watch the watcher."
 
 down:
 	docker compose down
@@ -26,41 +26,64 @@ logs:
 clean: down
 	docker compose rm -f
 
-# ── Tracer Bullet Tests ───────────────────────────────────────────────────────
+# ── Docker Watcher Tests ──────────────────────────────────────────────────────
 
-# Step 1: Register upstream A and verify routing works through the full stack.
+# Primary watcher test: web-a has envoyage labels in docker-compose.yml,
+# so it should be auto-discovered without any manual API call.
+# Wait a few seconds for the watcher's initial sync to complete.
+test-auto:
+	@echo ">>> Waiting for Docker watcher to discover web-a..."
+	@sleep 3
+	@echo ""
+	@echo ">>> Checking registry (web-a should appear automatically):"
+	curl -s http://localhost:8080/services | python3 -m json.tool
+	@echo ""
+	@echo ">>> VPS Envoy — should return 'Hello from upstream A':"
+	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web.example.com" http://localhost:10000
+	@echo ""
+	@echo ">>> Home Envoy — should also return 'Hello from upstream A':"
+	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web.example.com" http://localhost:10001
+
+# Register web-b manually (no labels on web-b in docker-compose.yml).
+# This proves the management API still works alongside the watcher.
+test-manual-b:
+	@echo ">>> Manually registering web-b via API..."
+	curl -s -X POST http://localhost:8080/services \
+		-H 'Content-Type: application/json' \
+		-d '{"name":"web-b","domain":"web-b.example.com","upstream":"web-b:5678"}'
+	@echo ""
+	@sleep 1
+	@echo ">>> VPS Envoy — should return 'Hello from upstream B':"
+	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web-b.example.com" http://localhost:10000
+
+# Verify the Split-Horizon routing still works correctly alongside the watcher.
+test-split-horizon:
+	@echo ">>> Split-Horizon verification (both paths → web-a)"
+	@echo ""
+	@echo "--- Path 1: VPS Envoy → Home Envoy → web-a ---"
+	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web.example.com" http://localhost:10000
+	@echo ""
+	@echo "--- Path 2: Home Envoy direct → web-a ---"
+	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web.example.com" http://localhost:10001
+
+# ── Legacy Manual Tests (still work) ─────────────────────────────────────────
+# These use the management API directly, bypassing the watcher.
+# Useful for testing services without Docker labels.
+
 test-add:
-	@echo ">>> Adding service 'web' → web-a:5678"
+	@echo ">>> Adding service 'web' → web-a:5678 via API"
 	curl -s -X POST http://localhost:8080/services \
 		-H 'Content-Type: application/json' \
 		-d '{"name":"web","domain":"web.example.com","upstream":"web-a:5678"}'
 	@echo ""
 	@sleep 2
-	@echo ">>> VPS Envoy (port 10000) — should show 'Hello from upstream A':"
+	@echo ">>> VPS Envoy:"
 	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web.example.com" http://localhost:10000
-	@echo ""
 
-# Step 2: Verify the Split-Horizon routing explicitly.
-# VPS Envoy (port 10000) → Home Envoy (port 10001) → web-a:5678
-# Both paths should return "Hello from upstream A".
-test-split-horizon:
-	@echo ">>> Split-Horizon verification"
-	@echo ""
-	@echo "--- Path 1: VPS Envoy (port 10000) → Home Envoy → web-a ---"
-	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web.example.com" http://localhost:10000
-	@echo ""
-	@echo "--- Path 2: Home Envoy direct (port 10001) → web-a ---"
-	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web.example.com" http://localhost:10001
-	@echo ""
-	@echo "Both should return 'Hello from upstream A'."
-	@echo "If Path 1 works and Path 2 works, the Split-Horizon routing is correct."
-
-# Step 3: Switch upstream to web-b. Both paths should update without restart.
 test-switch:
-	@echo ">>> Removing service 'web'"
+	@echo ">>> Removing 'web', re-adding → web-b:5678"
 	curl -s -X DELETE http://localhost:8080/services/web
 	@echo ""
-	@echo ">>> Adding service 'web' → web-b:5678"
 	curl -s -X POST http://localhost:8080/services \
 		-H 'Content-Type: application/json' \
 		-d '{"name":"web","domain":"web.example.com","upstream":"web-b:5678"}'
@@ -68,11 +91,9 @@ test-switch:
 	@sleep 2
 	@echo ">>> VPS Envoy (should show 'Hello from upstream B'):"
 	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web.example.com" http://localhost:10000
-	@echo ""
 
-# Step 4: Remove service. Both Envoys should return 404.
 test-remove:
-	@echo ">>> Removing service 'web'"
+	@echo ">>> Removing 'web'"
 	curl -s -X DELETE http://localhost:8080/services/web
 	@echo ""
 	@sleep 2
@@ -81,11 +102,9 @@ test-remove:
 	@echo ""
 	@echo ">>> Home Envoy (should get 404):"
 	curl -s -w "\n[HTTP %{http_code}]\n" -H "Host: web.example.com" http://localhost:10001
-	@echo ""
 
-# Verbose output for debugging the full HTTP exchange.
 test-debug:
-	@echo ">>> Adding service 'web' → web-a:5678"
+	@echo ">>> Adding 'web' → web-a:5678"
 	curl -s -X POST http://localhost:8080/services \
 		-H 'Content-Type: application/json' \
 		-d '{"name":"web","domain":"web.example.com","upstream":"web-a:5678"}'
@@ -93,9 +112,7 @@ test-debug:
 	@sleep 2
 	@echo ">>> Verbose request via VPS Envoy:"
 	curl -v -H "Host: web.example.com" http://localhost:10000 2>&1
-	@echo ""
 
-# Show current service registry state.
 list:
 	curl -s http://localhost:8080/services | python3 -m json.tool 2>/dev/null || \
 	curl -s http://localhost:8080/services

@@ -4,39 +4,37 @@ services:
   controlplane:
     build: .
     ports:
-      - "8080:8080"   # Management API  (curl http://localhost:8080/services)
-      - "9090:9090"   # xDS gRPC        (both Envoys connect here)
+      - "8080:8080"   # Management API
+      - "9090:9090"   # xDS gRPC
+    volumes:
+      # Docker socket mount: lets the watcher discover containers on the host.
+      # :ro — the control plane only reads events, never writes to the daemon.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - envoyage
 
-  # ── Home Envoy (simulates the Homeserver Envoy) ────────────────────────────
-  # Receives a snapshot where every cluster target is the real app container.
-  # Exposed on host port 10001 so you can probe it directly for debugging
-  # (in production, only the VPS Envoy is public-facing).
+  # ── Home Envoy ─────────────────────────────────────────────────────────────
   envoy-home:
     image: envoyproxy/envoy:v1.32-latest
     command: -c /etc/envoy/bootstrap.yaml --log-level info
     volumes:
       - ./envoy/bootstrap-home.yaml:/etc/envoy/bootstrap.yaml:ro
     ports:
-      - "10001:10000"  # Data plane ingress (host 10001 → container 10000)
+      - "10001:10000"  # Data plane (host 10001 → container 10000, debug only)
       - "9901:9901"    # Envoy admin UI
     depends_on:
       - controlplane
     networks:
       - envoyage
 
-  # ── VPS Envoy (simulates the Edge / Internet-facing Envoy) ─────────────────
-  # Receives a snapshot where every cluster target is envoy-home:10000.
-  # This simulates the WireGuard tunnel: VPS Envoy → Home Envoy → Container.
-  # This is the port external users would hit; test via host port 10000.
+  # ── VPS Envoy ──────────────────────────────────────────────────────────────
   envoy-vps:
     image: envoyproxy/envoy:v1.32-latest
     command: -c /etc/envoy/bootstrap.yaml --log-level info
     volumes:
       - ./envoy/bootstrap-vps.yaml:/etc/envoy/bootstrap.yaml:ro
     ports:
-      - "10000:10000"  # Data plane ingress (host 10000 → container 10000)
+      - "10000:10000"  # Data plane (internet-facing in production)
       - "9902:9902"    # Envoy admin UI
     depends_on:
       - controlplane
@@ -44,17 +42,25 @@ services:
     networks:
       - envoyage
 
-  # ── Dummy Upstreams ────────────────────────────────────────────────────────
-  # Tiny HTTP servers that identify themselves so we can verify routing.
-  # The home Envoy knows about these; the VPS Envoy never talks to them.
+  # ── Example app: label-discovered ─────────────────────────────────────────
+  # This container is discovered automatically by the Docker watcher.
+  # No manual API call needed — just the labels.
   web-a:
     image: python:3.12-alpine
     command: >
       sh -c "echo 'Hello from upstream A' > /tmp/index.html &&
              python3 -m http.server 5678 --directory /tmp"
+    labels:
+      envoyage.enable: "true"
+      envoyage.domain: "web.example.com"
+      envoyage.port:   "5678"
+      # envoyage.name is not set — falls back to compose service name "web-a"
     networks:
       - envoyage
 
+  # ── Unlabelled upstream (manual API only) ─────────────────────────────────
+  # web-b has no envoyage labels, so the watcher ignores it.
+  # Register it manually with: make test-manual-b
   web-b:
     image: python:3.12-alpine
     command: >
