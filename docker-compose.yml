@@ -1,50 +1,41 @@
+# Home node docker-compose.yml
+# Run this on your HOME machine (PC/homeserver).
+# The VPS gets its own docker-compose.vps.yml.
+#
+# Copy .env.example to .env and fill in your values before running.
+
 services:
 
-  # ── Control Plane ──────────────────────────────────────────────────────────
   controlplane:
     build: .
     ports:
       - "8080:8080"   # Management API
-      - "9090:9090"   # xDS gRPC
+      - "9090:9090"   # xDS gRPC (reachable from VPS via WireGuard)
     volumes:
-      # Docker socket mount: lets the watcher discover containers on the host.
-      # :ro — the control plane only reads events, never writes to the daemon.
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - ENVOYAGE_HOME_WG_IP=${ENVOYAGE_HOME_WG_IP:-envoy-home}
+      - ENVOYAGE_HOME_ENVOY_PORT=${ENVOYAGE_HOME_ENVOY_PORT:-10000}
+      - ENVOYAGE_XDS_ADDR=${ENVOYAGE_XDS_ADDR:-:9090}
+      - ENVOYAGE_API_ADDR=${ENVOYAGE_API_ADDR:-:8080}
+      - ENVOYAGE_HOME_NODE_ID=${ENVOYAGE_HOME_NODE_ID:-envoyage-envoy-home}
+      - ENVOYAGE_VPS_NODE_ID=${ENVOYAGE_VPS_NODE_ID:-envoyage-envoy-vps}
     networks:
       - envoyage
 
-  # ── Home Envoy ─────────────────────────────────────────────────────────────
   envoy-home:
     image: envoyproxy/envoy:v1.32-latest
     command: -c /etc/envoy/bootstrap.yaml --log-level info
     volumes:
       - ./envoy/bootstrap-home.yaml:/etc/envoy/bootstrap.yaml:ro
     ports:
-      - "10001:10000"  # Data plane (host 10001 → container 10000, debug only)
+      - "10000:10000"  # Home Envoy ingress (VPS routes WG traffic here)
       - "9901:9901"    # Envoy admin UI
     depends_on:
       - controlplane
     networks:
       - envoyage
 
-  # ── VPS Envoy ──────────────────────────────────────────────────────────────
-  envoy-vps:
-    image: envoyproxy/envoy:v1.32-latest
-    command: -c /etc/envoy/bootstrap.yaml --log-level info
-    volumes:
-      - ./envoy/bootstrap-vps.yaml:/etc/envoy/bootstrap.yaml:ro
-    ports:
-      - "10000:10000"  # Data plane (internet-facing in production)
-      - "9902:9902"    # Envoy admin UI
-    depends_on:
-      - controlplane
-      - envoy-home
-    networks:
-      - envoyage
-
-  # ── Example app: label-discovered ─────────────────────────────────────────
-  # This container is discovered automatically by the Docker watcher.
-  # No manual API call needed — just the labels.
   web-a:
     image: python:3.12-alpine
     command: >
@@ -54,13 +45,9 @@ services:
       envoyage.enable: "true"
       envoyage.domain: "web.example.com"
       envoyage.port:   "5678"
-      # envoyage.name is not set — falls back to compose service name "web-a"
     networks:
       - envoyage
 
-  # ── Unlabelled upstream (manual API only) ─────────────────────────────────
-  # web-b has no envoyage labels, so the watcher ignores it.
-  # Register it manually with: make test-manual-b
   web-b:
     image: python:3.12-alpine
     command: >

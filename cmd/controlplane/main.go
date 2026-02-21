@@ -10,54 +10,46 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/envoyage/envoyage/internal/config"
 	"github.com/envoyage/envoyage/internal/docker"
 	"github.com/envoyage/envoyage/internal/registry"
 	"github.com/envoyage/envoyage/internal/xds"
 )
 
-const (
-	xdsAddr = ":9090" // gRPC — Envoy connects here
-	apiAddr = ":8080" // HTTP — management API (debug / manual override)
-)
-
-// nodeIDs lists every Envoy instance this control plane manages.
-// Each gets a tailored snapshot: home Envoy routes to local containers,
-// VPS Envoy routes everything to the home Envoy (simulating the WireGuard
-// tunnel in production).
-var nodeIDs = []string{
-	"envoyage-envoy-home",
-	"envoyage-envoy-vps",
-}
-
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	// --- Config ---
+	cfg, err := config.Load()
+	if err != nil {
+		log.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
+	log.Info("config loaded",
+		"xds_addr", cfg.XDSAddr,
+		"api_addr", cfg.APIAddr,
+		"home_node", cfg.HomeNodeID,
+		"vps_node", cfg.VPSNodeID,
+		"home_envoy_ingress", cfg.HomeEnvoyIngress(),
+	)
+
 	// --- Registry ---
-	// Central in-memory store for all known services.
-	// Populated by two sources in parallel:
-	//   1. Docker Watcher (automatic, label-based)
-	//   2. Management API (manual, for testing and overrides)
 	reg := registry.New()
 
 	// --- xDS Server ---
-	xdsServer := xds.NewServer(reg, nodeIDs, log)
-
+	xdsServer := xds.NewServer(reg, cfg, log)
 	if err := xdsServer.Seed(); err != nil {
 		log.Error("failed to seed xDS", "error", err)
 		os.Exit(1)
 	}
 
 	// --- Docker Watcher ---
-	// Watches the Docker socket for containers with envoyage.* labels.
-	// Optional: if the socket is not mounted, we fall back to manual API only.
 	watcher, err := docker.NewWatcher(reg, log)
 	if err != nil {
-		log.Warn("docker watcher unavailable, falling back to manual API only",
-			"error", err)
+		log.Warn("docker watcher unavailable, falling back to manual API only", "error", err)
 	}
 
 	// --- Management API ---
-	// Stays active alongside the Docker watcher for debugging and overrides.
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /services", handleAddService(reg, log))
 	mux.HandleFunc("DELETE /services/{name}", handleRemoveService(reg, log))
@@ -84,13 +76,13 @@ func main() {
 	}
 
 	go func() {
-		log.Info("management API listening", "addr", apiAddr)
-		if err := http.ListenAndServe(apiAddr, mux); err != nil {
+		log.Info("management API listening", "addr", cfg.APIAddr)
+		if err := http.ListenAndServe(cfg.APIAddr, mux); err != nil {
 			log.Error("management API failed", "error", err)
 		}
 	}()
 
-	if err := xdsServer.Serve(ctx, xdsAddr); err != nil {
+	if err := xdsServer.Serve(ctx, cfg.XDSAddr); err != nil {
 		log.Error("xDS server failed", "error", err)
 		os.Exit(1)
 	}
@@ -115,11 +107,7 @@ func handleAddService(reg *registry.Registry, log *slog.Logger) http.HandlerFunc
 			http.Error(w, "name, domain, and upstream are required", http.StatusBadRequest)
 			return
 		}
-		svc := &registry.Service{
-			Name:     req.Name,
-			Domain:   req.Domain,
-			Upstream: req.Upstream,
-		}
+		svc := &registry.Service{Name: req.Name, Domain: req.Domain, Upstream: req.Upstream}
 		if err := reg.Add(svc); err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
@@ -146,9 +134,6 @@ func handleListServices(reg *registry.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		services, version := reg.Snapshot()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"version":  version,
-			"services": services,
-		})
+		json.NewEncoder(w).Encode(map[string]any{"version": version, "services": services})
 	}
 }

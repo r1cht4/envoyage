@@ -18,61 +18,32 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"github.com/envoyage/envoyage/internal/config"
 	"github.com/envoyage/envoyage/internal/registry"
 )
-
-// homeEnvoyNodeID is the canonical identifier for the home Envoy instance.
-// Must match node.id in envoy/bootstrap-home.yaml.
-const homeEnvoyNodeID = "envoyage-envoy-home"
-
-// homeEnvoyIngress is the address the VPS Envoy uses to reach the home Envoy.
-// In Docker Compose this is the service name + listener port.
-// In production this will be the WireGuard IP of the home node.
-const homeEnvoyIngress = "envoy-home:10000"
 
 // SnapshotBuilder translates the service registry into per-node xDS snapshots.
 //
 // Split-Horizon Routing
 //
-// The same logical service (e.g. "nextcloud → 192.168.1.50:8080") must be
-// represented differently depending on which Envoy is asking:
+// The same logical service (e.g. "nextcloud → 192.168.1.50:8080") is
+// represented differently depending on which Envoy is being configured:
 //
-//	Home Envoy (envoyage-envoy-home)
-//	  Cluster target: the actual app container (svc.Upstream)
-//	  Lives on the same host as the containers, so Docker DNS works.
+//	Home Envoy  → cluster target is the actual container IP:port
+//	VPS Envoy   → cluster target is cfg.HomeEnvoyIngress() (WireGuard IP)
 //
-//	VPS / Edge Envoy (envoyage-envoy-vps)
-//	  Cluster target: envoy-home:10000  (the home Envoy's ingress port)
-//	  Can't reach internal container IPs; WireGuard tunnel leads to home Envoy.
-//	  The home Envoy then re-routes based on the Host header.
-//
-// Both nodes share the same virtual host / domain configuration — only the
-// cluster endpoint differs. This means:
-//   - Domain-based routing works identically on both sides.
-//   - In production, swapping homeEnvoyIngress to a WireGuard IP is the only
-//     change needed to make the VPS Envoy work over the real tunnel.
-//
-// Envoy xDS resource hierarchy (reminder):
-//
-//	Listener (LDS)  — which port to listen on
-//	  └─ Route (RDS)    — match Host header → cluster name
-//	       └─ Cluster (CDS)  — upstream settings (timeout, LB policy)
-//	            └─ Endpoint (EDS) — actual IP:port to connect to
-//	                  └─ Secret (SDS) — TLS certificates
-type SnapshotBuilder struct{}
+// This means the VPS Envoy never needs to know about internal container IPs.
+// It only ever talks to the home Envoy, which handles the final hop locally.
+// Swapping the WireGuard IP is the only production change needed.
+type SnapshotBuilder struct {
+	cfg *config.Config
+}
 
-func NewSnapshotBuilder() *SnapshotBuilder {
-	return &SnapshotBuilder{}
+func NewSnapshotBuilder(cfg *config.Config) *SnapshotBuilder {
+	return &SnapshotBuilder{cfg: cfg}
 }
 
 // Build creates a complete xDS snapshot for a specific Envoy node.
-//
-// The nodeID parameter drives the Split-Horizon decision: home nodes get
-// direct container upstreams, edge nodes get the home Envoy as their upstream.
-//
-// A snapshot is an atomic, versioned bundle of all resource types. Pushing a
-// new snapshot makes go-control-plane diff it against the previous one and
-// stream only the changed resources to the connected Envoy.
 func (b *SnapshotBuilder) Build(nodeID string, services []*registry.Service, version uint64) (*cachev3.Snapshot, error) {
 	var (
 		clusters  []types.Resource
@@ -81,24 +52,16 @@ func (b *SnapshotBuilder) Build(nodeID string, services []*registry.Service, ver
 	)
 
 	versionStr := fmt.Sprintf("v%d", version)
-	isEdge := nodeID != homeEnvoyNodeID
+	isEdge := nodeID != b.cfg.HomeNodeID
 
 	for _, svc := range services {
 		clusterName := fmt.Sprintf("cluster_%s", svc.Name)
 
-		// Split-Horizon: choose upstream based on which node we're building for.
-		//
-		// Edge (VPS):
-		//   All traffic → home Envoy's ingress port. The home Envoy carries out
-		//   the actual per-service routing based on the Host header it receives.
-		//   In production, homeEnvoyIngress will be the WireGuard peer IP.
-		//
-		// Home:
-		//   Traffic → real app container. svc.Upstream is "host:port" as
-		//   registered via Docker discovery or the management API.
+		// Split-Horizon: VPS Envoy routes to home Envoy (WireGuard ingress).
+		// Home Envoy routes directly to the app container.
 		upstream := svc.Upstream
 		if isEdge {
-			upstream = homeEnvoyIngress
+			upstream = b.cfg.HomeEnvoyIngress()
 		}
 
 		clusters = append(clusters, makeCluster(clusterName, upstream))
@@ -125,8 +88,6 @@ func (b *SnapshotBuilder) Build(nodeID string, services []*registry.Service, ver
 		return nil, fmt.Errorf("creating snapshot: %w", err)
 	}
 
-	// Consistency check: validates that all referenced clusters and routes
-	// exist and are internally coherent before we push to Envoy.
 	if err := snap.Consistent(); err != nil {
 		return nil, fmt.Errorf("snapshot consistency check failed: %w", err)
 	}
@@ -134,11 +95,6 @@ func (b *SnapshotBuilder) Build(nodeID string, services []*registry.Service, ver
 	return snap, nil
 }
 
-// makeCluster builds an Envoy Cluster resource for the given upstream address.
-//
-// STRICT_DNS: Envoy resolves the hostname on first use and periodically
-// thereafter. Works well with Docker Compose service names (Docker's embedded
-// DNS handles them) and with WireGuard peer hostnames in production.
 func makeCluster(name, upstream string) *cluster.Cluster {
 	host, port := splitHostPort(upstream)
 
@@ -163,8 +119,6 @@ func makeCluster(name, upstream string) *cluster.Cluster {
 	}
 }
 
-// makeVirtualHost creates a VirtualHost that matches requests by Host header
-// and forwards them to the named cluster.
 func makeVirtualHost(name, domain, clusterName string) *route.VirtualHost {
 	return &route.VirtualHost{
 		Name:    name,
@@ -191,12 +145,6 @@ func makeRouteConfig(name string, virtualHosts []*route.VirtualHost) *route.Rout
 	}
 }
 
-// makeHTTPListener creates an Envoy Listener with an HTTP connection manager.
-//
-// Filter chain: Listener → FilterChain → HCM (network filter) → Router (HTTP filter)
-//
-// HCM parses HTTP/1.1 and HTTP/2 and delegates routing decisions to the Router
-// filter, which consults the RDS route config delivered via ADS.
 func makeHTTPListener(name string, port uint32, routeConfigName string) (*listener.Listener, error) {
 	routerAny, err := anypb.New(&routerv3.Router{})
 	if err != nil {
@@ -267,8 +215,6 @@ func makeAddress(host string, port uint32) *core.Address {
 	}
 }
 
-// splitHostPort parses "host:port" into components.
-// Returns port 0 if no port separator is found.
 func splitHostPort(upstream string) (string, uint32) {
 	for i := len(upstream) - 1; i >= 0; i-- {
 		if upstream[i] == ':' {
