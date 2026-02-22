@@ -45,7 +45,7 @@ This is the first vertical slice of Envoyage: a Go-based xDS control plane that 
 ## Quick Start
 
 ```bash
-# Prerequisites: Docker, Docker Compose, Go 1.23+
+# Prerequisites: Docker, Docker Compose, Go 1.24+
 
 # 1. Generate go.sum (first time only)
 go mod tidy
